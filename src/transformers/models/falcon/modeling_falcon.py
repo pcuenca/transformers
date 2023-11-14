@@ -65,7 +65,7 @@ _CONFIG_FOR_DOC = "FalconConfig"
 # In order not to degrade the quality of our HF-port, we keep these characteristics in the final model.
 class FalconLinear(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        hidden_states = input @ self.weight.T
+        hidden_states = input @ self.weight.permute([1, 0])
         if self.bias is None:
             return hidden_states
         return hidden_states + self.bias
@@ -240,7 +240,7 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torc
     # This is more or less identical to T5's relative position bias:
     # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
     arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
-    alibi = slopes[..., None].bfloat16() * arange_tensor
+    alibi = slopes[..., None].float() * arange_tensor
     return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
 
 
