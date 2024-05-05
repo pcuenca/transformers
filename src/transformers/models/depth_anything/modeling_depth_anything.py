@@ -32,6 +32,7 @@ from ...utils import logging
 from ..auto import AutoBackbone
 from .configuration_depth_anything import DepthAnythingConfig
 
+from ...models.dinov2.modeling_dinov2 import bilinear_resize
 
 logger = logging.get_logger(__name__)
 
@@ -195,21 +196,23 @@ class DepthAnythingFeatureFusionLayer(nn.Module):
 
     def forward(self, hidden_state, residual=None, size=None):
         if residual is not None:
-            if hidden_state.shape != residual.shape:
-                residual = nn.functional.interpolate(
-                    residual, size=(hidden_state.shape[2], hidden_state.shape[3]), mode="bilinear", align_corners=False
-                )
+            # I verified that the following condition is never met
+            # if hidden_state.shape != residual.shape:
+            #     print("not equal")
+            #     # residual = nn.functional.interpolate(
+            #     #     residual, size=(hidden_state.shape[2], hidden_state.shape[3]), mode="bilinear", align_corners=False
+            #     # )
             hidden_state = hidden_state + self.residual_layer1(residual)
 
         hidden_state = self.residual_layer2(hidden_state)
 
-        modifier = {"scale_factor": 2} if size is None else {"size": size}
+        if size is None:
+            size = 2 * hidden_state.shape[-2], 2 * hidden_state.shape[-1]
 
-        hidden_state = nn.functional.interpolate(
+        hidden_state = bilinear_resize(
             hidden_state,
-            **modifier,
-            mode="bilinear",
-            align_corners=True,
+            target_height=size[0],
+            target_width=size[1],
         )
         hidden_state = self.projection(hidden_state)
 
@@ -342,11 +345,10 @@ class DepthAnythingDepthEstimationHead(nn.Module):
         hidden_states = hidden_states[self.head_in_index]
 
         predicted_depth = self.conv1(hidden_states)
-        predicted_depth = nn.functional.interpolate(
+        predicted_depth = bilinear_resize(
             predicted_depth,
-            (int(patch_height * self.patch_size), int(patch_width * self.patch_size)),
-            mode="bilinear",
-            align_corners=True,
+            target_height=patch_height * self.patch_size,
+            target_width=patch_width * self.patch_size,
         )
         predicted_depth = self.conv2(predicted_depth)
         predicted_depth = self.activation1(predicted_depth)

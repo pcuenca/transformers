@@ -61,6 +61,54 @@ _IMAGE_CLASS_EXPECTED_OUTPUT = "tabby, tabby cat"
 from ..deprecated._archive_maps import DINOV2_PRETRAINED_MODEL_ARCHIVE_LIST  # noqa: F401, E402
 
 
+
+# Custom bilinear interpolation
+def bilinear_resize(image, target_height, target_width):
+    batch_size, channels, height, width = image.shape
+
+    # Calculate the scaling factors
+    height_scale = (height - 1) / (target_height - 1)
+    width_scale = (width - 1) / (target_width - 1)
+
+    # Create a grid of points where interpolation will be computed
+    map_x = torch.arange(target_height, device=image.device) * height_scale
+    map_y = torch.arange(target_width, device=image.device) * width_scale
+
+    # Compute the four surrounding points
+    x0 = map_x.floor().long()
+    x1 = x0 + 1
+    y0 = map_y.floor().long()
+    y1 = y0 + 1
+
+    # Ensure indices are within the boundaries of the input dimensions
+    # x0 = x0.clamp(0, height - 1)
+    # x1 = x1.clamp(0, height - 1)
+    # y0 = y0.clamp(0, width - 1)
+    # y1 = y1.clamp(0, width - 1)
+    x1 = torch.where(x1 >= height, height - 1, x1)
+    y1 = torch.where(y1 >= width, width - 1, y1)
+
+    # Calculate the fractional parts
+    x_frac = map_x - x0
+    y_frac = map_y - y0
+
+    # Expand to match batch size and channels
+    x_frac = x_frac.view(1, 1, target_height, 1).expand(batch_size, channels, target_height, target_width)
+    y_frac = y_frac.view(1, 1, 1, target_width).expand(batch_size, channels, target_height, target_width)
+
+    # Gather pixels from the image for interpolation
+    Ia = image[:, :, x0][:, :, :, y0]
+    Ib = image[:, :, x1][:, :, :, y0]
+    Ic = image[:, :, x0][:, :, :, y1]
+    Id = image[:, :, x1][:, :, :, y1]
+
+    # Perform bilinear interpolation
+    output = (Ia * (1 - x_frac) * (1 - y_frac) +
+            Ib * x_frac * (1 - y_frac) +
+            Ic * (1 - x_frac) * y_frac +
+            Id * x_frac * y_frac)
+    return output
+
 class Dinov2Embeddings(nn.Module):
     """
     Construct the CLS token, mask token, position and patch embeddings.
@@ -85,31 +133,25 @@ class Dinov2Embeddings(nn.Module):
         Source:
         https://github.com/facebookresearch/dino/blob/de9ee3df6cf39fac952ab558447af1fa1365362a/vision_transformer.py#L174
         """
-
-        num_patches = embeddings.shape[1] - 1
         num_positions = self.position_embeddings.shape[1] - 1
-        if num_patches == num_positions and height == width:
-            return self.position_embeddings
         class_pos_embed = self.position_embeddings[:, 0]
         patch_pos_embed = self.position_embeddings[:, 1:]
         dim = embeddings.shape[-1]
         height = height // self.config.patch_size
         width = width // self.config.patch_size
-        # we add a small number to avoid floating point error in the interpolation
-        # see discussion at https://github.com/facebookresearch/dino/issues/8
-        height, width = height + 0.1, width + 0.1
+
+        # This is constant so it's not a problem for tracing despite the warning
         patch_pos_embed = patch_pos_embed.reshape(1, int(math.sqrt(num_positions)), int(math.sqrt(num_positions)), dim)
         patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
         target_dtype = patch_pos_embed.dtype
-        patch_pos_embed = nn.functional.interpolate(
+
+        patch_pos_embed = bilinear_resize(
             patch_pos_embed.to(dtype=torch.float32),
-            scale_factor=(float(height / math.sqrt(num_positions)), float(width / math.sqrt(num_positions))),
-            mode="bicubic",
-            align_corners=False,
+            target_height=height,
+            target_width=width,
         ).to(dtype=target_dtype)
-        if int(height) != patch_pos_embed.shape[-2] or int(width) != patch_pos_embed.shape[-1]:
-            raise ValueError("Width or height does not match with the interpolated position embeddings")
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).reshape(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
 
     def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -157,12 +199,6 @@ class Dinov2PatchEmbeddings(nn.Module):
         self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        num_channels = pixel_values.shape[1]
-        if num_channels != self.num_channels:
-            raise ValueError(
-                "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
-                f" Expected {self.num_channels} but got {num_channels}."
-            )
         embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
         return embeddings
 
