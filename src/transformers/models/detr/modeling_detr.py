@@ -437,16 +437,34 @@ class DetrSinePositionEmbedding(nn.Module):
             scale = 2 * math.pi
         self.scale = scale
 
+    def cumsum_for_full_2d_mask(self, shape, dim=1):
+        mask = torch.ones(shape)
+        r = 1 + torch.arange(mask.shape[dim])
+        other_dim = 2 if dim == 1 else 1
+        # Hardcoding for each value of dim
+        if dim == 1:
+            r = r.repeat_interleave(shape[other_dim])
+            r = r.view(shape[1:])
+        else:
+            r = r.view(1, shape[dim])
+            r = r.repeat_interleave(shape[other_dim], dim=0)
+        r = r.unsqueeze(0)
+        r = r.repeat_interleave(shape[0], dim=0)
+        return r
+
     def forward(self, pixel_values, pixel_mask):
         if pixel_mask is None:
             raise ValueError("No pixel mask provided")
-        y_embed = pixel_mask.cumsum(1, dtype=torch.float32)
-        x_embed = pixel_mask.cumsum(2, dtype=torch.float32)
+        # Note: this alternative to cumsum only works for full masks!
+        # Note: we could also implement this as part of the conversion process
+        # to avoid modifications to transformers
+        y_embed = self.cumsum_for_full_2d_mask(pixel_mask.shape, dim=1)
+        x_embed = self.cumsum_for_full_2d_mask(pixel_mask.shape, dim=2)
         if self.normalize:
             y_embed = y_embed / (y_embed[:, -1:, :] + 1e-6) * self.scale
             x_embed = x_embed / (x_embed[:, :, -1:] + 1e-6) * self.scale
 
-        dim_t = torch.arange(self.embedding_dim, dtype=torch.int64, device=pixel_values.device).float()
+        dim_t = torch.arange(self.embedding_dim, dtype=torch.int16, device=pixel_values.device).float()
         dim_t = self.temperature ** (2 * torch.div(dim_t, 2, rounding_mode="floor") / self.embedding_dim)
 
         pos_x = x_embed[:, :, :, None] / dim_t
@@ -1071,7 +1089,11 @@ class DetrEncoder(DetrPreTrainedModel):
         # expand attention_mask
         if attention_mask is not None:
             # [batch_size, seq_len] -> [batch_size, 1, target_seq_len, source_seq_len]
-            attention_mask = _prepare_4d_attention_mask(attention_mask, inputs_embeds.dtype)
+            # attention_mask = _prepare_4d_attention_mask(attention_mask, inputs_embeds.dtype)
+            # Assume full mask
+            assert attention_mask.all().item()
+            bs, seqlen = attention_mask.shape
+            attention_mask = torch.zeros((bs, 1, seqlen, seqlen))
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -1225,9 +1247,12 @@ class DetrDecoder(DetrPreTrainedModel):
         # expand encoder attention mask
         if encoder_hidden_states is not None and encoder_attention_mask is not None:
             # [batch_size, seq_len] -> [batch_size, 1, target_seq_len, source_seq_len]
-            encoder_attention_mask = _prepare_4d_attention_mask(
-                encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
-            )
+            assert encoder_attention_mask.all().item()
+            bs, seqlen = encoder_attention_mask.shape
+            encoder_attention_mask = torch.zeros(bs, 1, input_shape[-1], seqlen)
+            # encoder_attention_mask = _prepare_4d_attention_mask(
+            #     encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+            # )
 
         # optional intermediate hidden states
         intermediate = () if self.config.auxiliary_loss else None
@@ -1986,7 +2011,8 @@ class DetrMHAttentionMap(nn.Module):
         weights = torch.einsum("bqnc,bnchw->bqnhw", queries_per_head * self.normalize_fact, keys_per_head)
 
         if mask is not None:
-            weights.masked_fill_(mask.unsqueeze(1).unsqueeze(1), torch.finfo(weights.dtype).min)
+            assert mask.any().item() == False
+            # weights.masked_fill_(mask.unsqueeze(1).unsqueeze(1), torch.finfo(weights.dtype).min)
         weights = nn.functional.softmax(weights.flatten(2), dim=-1).view(weights.size())
         weights = self.dropout(weights)
         return weights
