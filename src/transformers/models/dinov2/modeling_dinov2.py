@@ -167,6 +167,122 @@ class Dinov2PatchEmbeddings(nn.Module):
         return embeddings
 
 
+# So we get 2 chunks using split_einsum_v2
+CHUNK_SIZE = 907
+
+def split_einsum(q, k, v, mask, heads, dim_head):
+    """ Attention Implementation backing AttentionImplementations.SPLIT_EINSUM
+
+    - Implements https://machinelearning.apple.com/research/neural-engine-transformers
+    - Recommended for ANE
+    - Marginally slower on GPU
+    """
+    mh_q = [
+        q[:, head_idx * dim_head:(head_idx + 1) *
+          dim_head, :, :] for head_idx in range(heads)
+    ]  # (bs, dim_head, 1, max_seq_length) * heads
+
+    k = k.transpose(1, 3)
+    mh_k = [
+        k[:, :, :,
+          head_idx * dim_head:(head_idx + 1) * dim_head]
+        for head_idx in range(heads)
+    ]  # (bs, max_seq_length, 1, dim_head) * heads
+
+    mh_v = [
+        v[:, head_idx * dim_head:(head_idx + 1) *
+          dim_head, :, :] for head_idx in range(heads)
+    ]  # (bs, dim_head, 1, max_seq_length) * heads
+
+    attn_weights = [
+        torch.einsum("bchq,bkhc->bkhq", [qi, ki]) * (dim_head**-0.5)
+        for qi, ki in zip(mh_q, mh_k)
+    ]  # (bs, max_seq_length, 1, max_seq_length) * heads
+
+    if mask is not None:
+        for head_idx in range(heads):
+            attn_weights[head_idx] = attn_weights[head_idx] + mask
+
+    attn_weights = [
+        aw.softmax(dim=1) for aw in attn_weights
+    ]  # (bs, max_seq_length, 1, max_seq_length) * heads
+    attn = [
+        torch.einsum("bkhq,bchk->bchq", wi, vi)
+        for wi, vi in zip(attn_weights, mh_v)
+    ]  # (bs, dim_head, 1, max_seq_length) * heads
+
+    attn = torch.cat(attn, dim=1)  # (bs, dim, 1, max_seq_length)
+    return attn
+
+def split_einsum_v2(q, k, v, mask, heads, dim_head):
+    """ Attention Implementation backing AttentionImplementations.SPLIT_EINSUM_V2
+
+    - Implements https://machinelearning.apple.com/research/neural-engine-transformers
+    - Recommended for ANE
+    - Marginally slower on GPU
+    - Chunks the query sequence to avoid large intermediate tensors and improves ANE performance
+    """
+    query_seq_length = q.size(3)
+    num_chunks = query_seq_length // CHUNK_SIZE
+    
+    if num_chunks == 0:
+        logger.info(
+            "AttentionImplementations.SPLIT_EINSUM_V2: query sequence too short to chunk "
+            f"({query_seq_length}<{CHUNK_SIZE}), fall back to AttentionImplementations.SPLIT_EINSUM (safe to ignore)")
+        return split_einsum(q, k, v, mask, heads, dim_head)
+    
+    logger.info(
+        "AttentionImplementations.SPLIT_EINSUM_V2: Splitting query sequence length of "
+        f"{query_seq_length} into {num_chunks} chunks")
+
+    mh_q = [
+        q[:, head_idx * dim_head:(head_idx + 1) *
+          dim_head, :, :] for head_idx in range(heads)
+    ]  # (bs, dim_head, 1, max_seq_length) * heads
+
+    # Chunk the query sequence for each head
+    mh_q_chunked = [
+        [h_q[..., chunk_idx * CHUNK_SIZE:(chunk_idx + 1) * CHUNK_SIZE] for chunk_idx in range(num_chunks)]
+        for h_q in mh_q
+    ]  # ((bs, dim_head, 1, QUERY_SEQ_CHUNK_SIZE) * num_chunks) * heads
+
+    k = k.transpose(1, 3)
+    mh_k = [
+        k[:, :, :,
+          head_idx * dim_head:(head_idx + 1) * dim_head]
+        for head_idx in range(heads)
+    ]  # (bs, max_seq_length, 1, dim_head) * heads
+
+    mh_v = [
+        v[:, head_idx * dim_head:(head_idx + 1) *
+          dim_head, :, :] for head_idx in range(heads)
+    ]  # (bs, dim_head, 1, max_seq_length) * heads
+
+    attn_weights = [
+        [
+            torch.einsum("bchq,bkhc->bkhq", [qi_chunk, ki]) * (dim_head**-0.5)
+            for qi_chunk in h_q_chunked
+        ] for h_q_chunked, ki in zip(mh_q_chunked, mh_k)
+    ]  # ((bs, max_seq_length, 1, chunk_size) * num_chunks) * heads
+
+    attn_weights = [
+        [aw_chunk.softmax(dim=1) for aw_chunk in aw_chunked]
+        for aw_chunked in attn_weights
+    ]  # ((bs, max_seq_length, 1, chunk_size) * num_chunks) * heads
+
+    attn = [
+        [
+            torch.einsum("bkhq,bchk->bchq", wi_chunk, vi)
+            for wi_chunk in wi_chunked
+        ] for wi_chunked, vi in zip(attn_weights, mh_v)
+    ]  # ((bs, dim_head, 1, chunk_size) * num_chunks) * heads
+
+    attn = torch.cat([
+        torch.cat(attn_chunked, dim=3) for attn_chunked in attn
+    ], dim=1)  # (bs, dim, 1, max_seq_length)
+
+    return attn
+
 # Copied from transformers.models.vit.modeling_vit.ViTSelfAttention with ViT->Dinov2
 class Dinov2SelfAttention(nn.Module):
     def __init__(self, config: Dinov2Config) -> None:
@@ -193,6 +309,27 @@ class Dinov2SelfAttention(nn.Module):
         return x.permute(0, 2, 1, 3)
 
     def forward(
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        # original = self.forward_original(hidden_states, head_mask, output_attentions)
+
+        # print("Patched attention implementation")
+
+        k = self.key(hidden_states)
+        v = self.value(hidden_states)
+        q = self.query(hidden_states)
+
+        q = q.permute(0, 2, 1).unsqueeze(2)
+        v = v.permute(0, 2, 1).unsqueeze(2)
+        k = k.permute(0, 2, 1).unsqueeze(2)
+
+        # Let's try split_einsum as the last dim is very unfriendly (1814)
+        alternative = split_einsum(q, k, v, mask=None, heads=self.num_attention_heads, dim_head=self.attention_head_size)
+        alternative = alternative.squeeze(2).permute(0, 2, 1)
+        return (alternative,)
+
+
+    def forward_original(
         self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
         mixed_query_layer = self.query(hidden_states)
