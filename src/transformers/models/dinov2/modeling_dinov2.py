@@ -167,8 +167,7 @@ class Dinov2PatchEmbeddings(nn.Module):
         return embeddings
 
 
-# So we get 2 chunks using split_einsum_v2
-CHUNK_SIZE = 907
+CHUNK_SIZE = 512
 
 def split_einsum(q, k, v, mask, heads, dim_head):
     """ Attention Implementation backing AttentionImplementations.SPLIT_EINSUM
@@ -224,6 +223,15 @@ def split_einsum_v2(q, k, v, mask, heads, dim_head):
     """
     query_seq_length = q.size(3)
     num_chunks = query_seq_length // CHUNK_SIZE
+
+    needs_padding = query_seq_length % CHUNK_SIZE != 0
+    if needs_padding:
+        num_chunks += 1
+        pad_length = num_chunks * CHUNK_SIZE - query_seq_length
+        z = torch.zeros(q.shape[:-1] + (pad_length,), dtype=q.dtype)
+        q = torch.cat((q, z), dim=-1)
+        k = torch.cat((k, z), dim=-1)
+        v = torch.cat((v, z), dim=-1)
     
     if num_chunks == 0:
         logger.info(
@@ -280,6 +288,9 @@ def split_einsum_v2(q, k, v, mask, heads, dim_head):
     attn = torch.cat([
         torch.cat(attn_chunked, dim=3) for attn_chunked in attn
     ], dim=1)  # (bs, dim, 1, max_seq_length)
+
+    if needs_padding:
+        attn = attn[..., :query_seq_length]
 
     return attn
 
