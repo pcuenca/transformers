@@ -43,6 +43,7 @@ from ...utils import (
 from ...utils.backbone_utils import BackboneMixin
 from .configuration_dinov2 import Dinov2Config
 
+from .ane_transformers import *
 
 logger = logging.get_logger(__name__)
 
@@ -171,6 +172,8 @@ class Dinov2PatchEmbeddings(nn.Module):
 class Dinov2SelfAttention(nn.Module):
     def __init__(self, config: Dinov2Config) -> None:
         super().__init__()
+        self._register_load_state_dict_pre_hook(linear_to_conv2d_map)
+
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
                 f"The hidden size {config.hidden_size,} is not a multiple of the number of attention "
@@ -181,9 +184,14 @@ class Dinov2SelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        if True:    # 4D tensors
+            self.query = nn.Conv2d(config.hidden_size, self.all_head_size, kernel_size=1, bias=config.qkv_bias)
+            self.key = nn.Conv2d(config.hidden_size, self.all_head_size, kernel_size=1, bias=config.qkv_bias)
+            self.value = nn.Conv2d(config.hidden_size, self.all_head_size, kernel_size=1, bias=config.qkv_bias)
+        else:
+            self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+            self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+            self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -193,6 +201,17 @@ class Dinov2SelfAttention(nn.Module):
         return x.permute(0, 2, 1, 3)
 
     def forward(
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        k = self.key(hidden_states)
+        v = self.value(hidden_states)
+        q = self.query(hidden_states)
+
+        outputs = split_einsum(q, k, v, mask=None, heads=self.num_attention_heads, dim_head=self.attention_head_size)
+        return (outputs,)
+
+
+    def forward_original(
         self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
         mixed_query_layer = self.query(hidden_states)
@@ -237,7 +256,7 @@ class Dinov2SelfOutput(nn.Module):
 
     def __init__(self, config: Dinov2Config) -> None:
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=1)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -293,7 +312,12 @@ class Dinov2LayerScale(nn.Module):
         self.lambda1 = nn.Parameter(config.layerscale_value * torch.ones(config.hidden_size))
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        return hidden_state * self.lambda1
+        if True:
+            # 4D - TODO: verify on init and remove view()
+            return hidden_state * self.lambda1.view(1, hidden_state.shape[1], 1, 1)
+        else:
+            # Original impl
+            return hidden_state * self.lambda1
 
 
 # Copied from transformers.models.beit.modeling_beit.drop_path
@@ -337,12 +361,12 @@ class Dinov2MLP(nn.Module):
         super().__init__()
         in_features = out_features = config.hidden_size
         hidden_features = int(config.hidden_size * config.mlp_ratio)
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=1, bias=True)
         if isinstance(config.hidden_act, str):
             self.activation = ACT2FN[config.hidden_act]
         else:
             self.activation = config.hidden_act
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1, bias=True)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         hidden_state = self.fc1(hidden_state)
@@ -367,19 +391,17 @@ class Dinov2SwiGLUFFN(nn.Module):
         hidden = nn.functional.silu(x1) * x2
         return self.weights_out(hidden)
 
-
 class Dinov2Layer(nn.Module):
     """This corresponds to the Block class in the original implementation."""
 
     def __init__(self, config: Dinov2Config) -> None:
         super().__init__()
-
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm1 = LayerNormANE(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = Dinov2Attention(config)
         self.layer_scale1 = Dinov2LayerScale(config)
         self.drop_path = Dinov2DropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
 
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = LayerNormANE(config.hidden_size, eps=config.layer_norm_eps)
 
         if config.use_swiglu_ffn:
             self.mlp = Dinov2SwiGLUFFN(config)
@@ -822,6 +844,9 @@ class Dinov2Backbone(Dinov2PreTrainedModel, BackboneMixin):
 
         embedding_output = self.embeddings(pixel_values)
 
+        # Convert to 4D
+        embedding_output = embedding_output.permute(0, 2, 1).unsqueeze(2)
+
         outputs = self.encoder(
             embedding_output, output_hidden_states=True, output_attentions=output_attentions, return_dict=return_dict
         )
@@ -831,6 +856,8 @@ class Dinov2Backbone(Dinov2PreTrainedModel, BackboneMixin):
         feature_maps = ()
         for stage, hidden_state in zip(self.stage_names, hidden_states):
             if stage in self.out_features:
+                # Go back to 3D for the output feature
+                hidden_state = hidden_state.squeeze(2).permute(0, 2, 1)
                 if self.config.apply_layernorm:
                     hidden_state = self.layernorm(hidden_state)
                 if self.config.reshape_hidden_states:
